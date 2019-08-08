@@ -103,5 +103,6 @@ export interface AudioRecorderOptions {
 export const AudioPlayerEvents = {
   seek: 'seek',
   paused: 'paused',
-  started: 'started'
+  started: 'started',
+  ready: 'ready'
 };

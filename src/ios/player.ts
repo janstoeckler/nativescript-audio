@@ -1,17 +1,25 @@
+import { Observable } from 'tns-core-modules/data/observable';
 import { knownFolders, path } from 'tns-core-modules/file-system';
 import { isString } from 'tns-core-modules/utils/types';
 import { TNSPlayerI, TNSPlayerUtil, TNS_Player_Log } from '../common';
-import { AudioPlayerOptions } from '../options';
-
-declare var AVAudioPlayer;
+import { AudioPlayerEvents, AudioPlayerOptions } from '../options';
 
 export class TNSPlayer extends NSObject implements TNSPlayerI {
-  public static ObjCProtocols = [AVAudioPlayerDelegate];
-  private _player: AVAudioPlayer;
-  private _task: NSURLSessionDataTask;
-  private _completeCallback: any;
-  private _errorCallback: any;
-  private _infoCallback: any;
+  private _player: AVPlayer;
+  private _events: Observable;
+
+  /**
+   * Status Observer is for watching the status of the AVPlayerItem to know if playback is ready or not.
+   */
+  private _statusObserver;
+  private _statusObserverActive: boolean;
+
+  get events() {
+    if (!this._events) {
+      this._events = new Observable();
+    }
+    return this._events;
+  }
 
   get ios(): any {
     return this._player;
@@ -21,29 +29,35 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
     TNSPlayerUtil.debug = value;
   }
 
-  public get volume(): number {
+  get volume(): number {
     return this._player ? this._player.volume : 0;
   }
 
-  public set volume(value: number) {
+  set volume(value: number) {
     if (this._player && value >= 0) {
       this._player.volume = value;
     }
   }
 
-  public get duration() {
-    if (this._player) {
-      return this._player.duration;
+  get duration() {
+    if (this._player && this._player.currentItem) {
+      const seconds = CMTimeGetSeconds(this._player.currentItem.asset.duration);
+      const milliseconds = seconds * 1000.0;
+      return milliseconds;
     } else {
       return 0;
     }
   }
 
   get currentTime(): number {
-    return this._player ? this._player.currentTime : 0;
+    if (this._player && this._player.currentItem) {
+      return (this._player.currentTime().value / this._player.currentTime().timescale) * 1000;
+    } else {
+      return 0;
+    }
   }
 
-  public initFromFile(options: AudioPlayerOptions): Promise<any> {
+  initFromFile(options: AudioPlayerOptions): Promise<any> {
     return new Promise((resolve, reject) => {
       // init only
       options.autoPlay = false;
@@ -51,15 +65,11 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
     });
   }
 
-  public playFromFile(options: AudioPlayerOptions): Promise<any> {
+  playFromFile(options: AudioPlayerOptions): Promise<any> {
     return new Promise((resolve, reject) => {
-      // only if not explicitly set, default to true
-      if (options.autoPlay !== false) {
-        options.autoPlay = true;
-      }
-
       try {
-        let audioPath;
+        this._statusObserver = PlayerObserverClass.alloc();
+        this._statusObserver['_owner'] = this;
 
         let fileName = isString(options.audioFile) ? options.audioFile.trim() : '';
         if (fileName.indexOf('~/') === 0) {
@@ -67,69 +77,38 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
         }
         TNS_Player_Log('fileName', fileName);
 
-        this._completeCallback = options.completeCallback;
-        this._errorCallback = options.errorCallback;
-        this._infoCallback = options.infoCallback;
+        this._setIOSAudioSessionOutput();
+        this._setupPlayerItem(fileName, true);
 
-        let audioSession = AVAudioSession.sharedInstance();
-        audioSession.setCategoryWithOptionsError(
-          AVAudioSessionCategoryAmbient,
-          AVAudioSessionCategoryOptions.DuckOthers
-        );
-        let output = audioSession.currentRoute.outputs.lastObject.portType;
-        TNS_Player_Log('output', output);
-
-        if (output.match(/Receiver/)) {
-          try {
-            audioSession.setCategoryError(AVAudioSessionCategoryPlayAndRecord);
-            audioSession.overrideOutputAudioPortError(AVAudioSessionPortOverride.Speaker);
-            audioSession.setActiveError(true);
-            TNS_Player_Log('audioSession category set and active');
-          } catch (err) {
-            TNS_Player_Log('setting audioSession category failed');
-          }
+        if (options.loop) {
+          // Invoke after player is created and AVPlayerItem is specified
+          NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(
+            this,
+            'playerItemDidReachEnd',
+            AVPlayerItemDidPlayToEndTimeNotification,
+            this._player.currentItem
+          );
         }
 
-        const errorRef = new interop.Reference();
-        this._player = AVAudioPlayer.alloc().initWithContentsOfURLError(NSURL.fileURLWithPath(fileName), errorRef);
-        if (errorRef && errorRef.value) {
-          reject(errorRef.value);
-          return;
-        } else if (this._player) {
-          this._player.delegate = this;
-
-          // enableRate to change playback speed
-          this._player.enableRate = true;
-
-          TNS_Player_Log('this._player', this._player);
-
-          if (options.metering) {
-            TNS_Player_Log('enabling metering...');
-            this._player.meteringEnabled = true;
-          }
-
-          if (options.loop) {
-            this._player.numberOfLoops = -1;
-          }
-
-          if (options.autoPlay) {
-            this._player.play();
-          }
-
-          resolve();
-        } else {
-          reject();
+        if (options.autoPlay) {
+          this._player.play();
         }
+
+        resolve();
       } catch (ex) {
-        if (this._errorCallback) {
-          this._errorCallback({ ex });
-        }
         reject(ex);
       }
     });
   }
 
-  public initFromUrl(options: AudioPlayerOptions): Promise<any> {
+  playerItemDidReachEnd() {
+    if (this._player) {
+      this._player.seekToTime(kCMTimeZero);
+      this._player.play();
+    }
+  }
+
+  initFromUrl(options: AudioPlayerOptions): Promise<any> {
     return new Promise((resolve, reject) => {
       // init only
       options.autoPlay = false;
@@ -137,106 +116,38 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
     });
   }
 
-  public playFromUrl(options: AudioPlayerOptions): Promise<any> {
+  playFromUrl(options: AudioPlayerOptions): Promise<any> {
     return new Promise((resolve, reject) => {
-      // only if not explicitly set, default to true
-      if (options.autoPlay !== false) {
-        options.autoPlay = true;
-      }
-
       try {
-        this._task = NSURLSession.sharedSession.dataTaskWithURLCompletionHandler(
-          NSURL.URLWithString(options.audioFile),
-          (data, response, error) => {
-            if (error !== null) {
-              if (this._errorCallback) {
-                this._errorCallback({ error });
-              }
+        this._statusObserver = PlayerObserverClass.alloc();
+        this._statusObserver['_owner'] = this;
 
-              reject();
-            }
+        this._setIOSAudioSessionOutput();
+        this._setupPlayerItem(options.audioFile, false);
 
-            this._completeCallback = options.completeCallback;
-            this._errorCallback = options.errorCallback;
-            this._infoCallback = options.infoCallback;
-
-            let audioSession = AVAudioSession.sharedInstance();
-            audioSession.setCategoryWithOptionsError(
-              AVAudioSessionCategoryAmbient,
-              AVAudioSessionCategoryOptions.DuckOthers
-            );
-            let output = audioSession.currentRoute.outputs.lastObject.portType;
-
-            if (output.match(/Receiver/)) {
-              try {
-                audioSession.setCategoryError(AVAudioSessionCategoryPlayAndRecord);
-                audioSession.overrideOutputAudioPortError(AVAudioSessionPortOverride.Speaker);
-                audioSession.setActiveError(true);
-                TNS_Player_Log('audioSession category set and active');
-              } catch (err) {
-                TNS_Player_Log('setting audioSession category failed');
-              }
-            }
-
-            const errorRef = new interop.Reference();
-            this._player = AVAudioPlayer.alloc().initWithDataError(data, errorRef);
-            if (errorRef && errorRef.value) {
-              reject(errorRef.value);
-              return;
-            } else if (this._player) {
-              this._player.delegate = this;
-              TNS_Player_Log('this._player', this._player);
-
-              // enableRate to change playback speed
-              this._player.enableRate = true;
-
-              this._player.numberOfLoops = options.loop ? -1 : 0;
-
-              if (options.metering) {
-                TNS_Player_Log('enabling metering...');
-                this._player.meteringEnabled = true;
-              }
-
-              if (options.autoPlay) {
-                this._player.play();
-              }
-
-              resolve();
-            } else {
-              reject();
-            }
-          }
-        );
-
-        this._task.resume();
+        resolve();
       } catch (ex) {
-        if (this._errorCallback) {
-          this._errorCallback({ ex });
-        }
         reject(ex);
       }
     });
   }
 
-  public pause(): Promise<any> {
+  pause(): Promise<any> {
     return new Promise((resolve, reject) => {
       try {
-        if (this._player && this._player.playing) {
+        if (this._player && this._player.timeControlStatus === AVPlayerTimeControlStatus.Playing) {
           TNS_Player_Log('pausing player...');
           this._player.pause();
           resolve(true);
         }
       } catch (ex) {
-        if (this._errorCallback) {
-          this._errorCallback({ ex });
-        }
         TNS_Player_Log('pause error', ex);
         reject(ex);
       }
     });
   }
 
-  public play(): Promise<any> {
+  play(): Promise<any> {
     return new Promise((resolve, reject) => {
       try {
         if (!this.isAudioPlaying()) {
@@ -245,35 +156,32 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
           resolve(true);
         }
       } catch (ex) {
-        if (this._errorCallback) {
-          this._errorCallback({ ex });
-        }
         TNS_Player_Log('play error', ex);
         reject(ex);
       }
     });
   }
 
-  public resume(): void {
-    if (this._player) {
+  resume(): void {
+    if (this._player && this._player.currentItem) {
       TNS_Player_Log('resuming player...');
       this._player.play();
     }
   }
 
-  public playAtTime(time: number): void {
-    if (this._player) {
+  playAtTime(time: number): void {
+    if (this._player && this._player.currentItem) {
       TNS_Player_Log('playAtTime', time);
-      this._player.playAtTime(time);
+      this._player.seekToTime(CMTimeMakeWithSeconds(time, 1000));
     }
   }
 
-  public seekTo(time: number): Promise<any> {
+  seekTo(time: number): Promise<any> {
     return new Promise((resolve, reject) => {
       try {
-        if (this._player) {
+        if (this._player.currentItem && this._player.currentItem.status === AVPlayerItemStatus.ReadyToPlay) {
           TNS_Player_Log('seekTo', time);
-          this._player.currentTime = time;
+          this._player.seekToTime(CMTimeMakeWithSeconds(time, 1000));
           resolve(true);
         }
       } catch (ex) {
@@ -283,48 +191,49 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
     });
   }
 
-  public dispose(): Promise<any> {
+  dispose(): Promise<any> {
     return new Promise((resolve, reject) => {
       try {
         TNS_Player_Log('disposing TNSPlayer...');
-        if (this._player && this.isAudioPlaying()) {
-          this._player.stop();
+
+        if (this._player) {
+          // remove the status observer from the AVPlayerItem
+          if (this._player.currentItem) {
+            this._removeStatusObserver(this._player.currentItem);
+          }
+
+          this._player.pause();
+          this._player.replaceCurrentItemWithPlayerItem(null); // de-allocates the AVPlayer
+          this._player = null;
         }
-        var audioSession = AVAudioSession.sharedInstance();
-        audioSession.setActiveError(false);
-        this._reset();
+
         resolve();
       } catch (ex) {
-        if (this._errorCallback) {
-          this._errorCallback({ ex });
-        }
         TNS_Player_Log('dispose error', ex);
         reject(ex);
       }
     });
   }
 
-  public isAudioPlaying(): boolean {
-    return this._player ? this._player.playing : false;
+  isAudioPlaying(): boolean {
+    return this._player && this._player.timeControlStatus === AVPlayerTimeControlStatus.Playing ? true : false;
   }
 
-  public getAudioTrackDuration(): Promise<string> {
+  getAudioTrackDuration(): Promise<string> {
     return new Promise((resolve, reject) => {
       try {
-        const duration = this._player ? this._player.duration : 0;
-        TNS_Player_Log('audio track duration', duration);
-        resolve(duration.toString());
+        const seconds = CMTimeGetSeconds(this._player.currentItem.asset.duration);
+        const milliseconds = seconds * 1000.0;
+        TNS_Player_Log('audio track duration', milliseconds);
+        resolve(milliseconds.toString());
       } catch (ex) {
-        if (this._errorCallback) {
-          this._errorCallback({ ex });
-        }
         TNS_Player_Log('getAudioTrackDuration error', ex);
         reject(ex);
       }
     });
   }
 
-  public changePlayerSpeed(speed) {
+  changePlayerSpeed(speed) {
     if (this._player && speed) {
       // make sure speed is a number/float
       if (typeof speed === 'string') {
@@ -334,27 +243,101 @@ export class TNSPlayer extends NSObject implements TNSPlayerI {
     }
   }
 
-  public audioPlayerDidFinishPlayingSuccessfully(player?: any, flag?: boolean) {
-    if (flag && this._completeCallback) {
-      this._completeCallback({ player, flag });
-    } else if (!flag && this._errorCallback) {
-      this._errorCallback({ player, flag });
+  //  audioPlayerDidFinishPlayingSuccessfully(player?: any, flag?: boolean) {
+  //   if (flag && this._completeCallback) {
+  //     this._completeCallback({ player, flag });
+  //   } else if (!flag && this._errorCallback) {
+  //     this._errorCallback({ player, flag });
+  //   }
+  // }
+
+  //  audioPlayerDecodeErrorDidOccurError(player: any, error: NSError) {
+  //   if (this._errorCallback) {
+  //     this._errorCallback({ player, error });
+  //   }
+  // }
+
+  /**
+   * Notify events by name and optionally pass data
+   */
+  _sendEvent(eventName: string, data?: any) {
+    if (this.events) {
+      this.events.notify(<any>{
+        eventName,
+        object: this,
+        data: data
+      });
     }
   }
 
-  public audioPlayerDecodeErrorDidOccurError(player: any, error: NSError) {
-    if (this._errorCallback) {
-      this._errorCallback({ player, error });
+  private _setupPlayerItem(audioUrl, isLocalFile: boolean) {
+    let url;
+    if (isLocalFile) {
+      url = NSURL.fileURLWithPath(audioUrl);
+    } else {
+      url = NSURL.URLWithString(audioUrl);
+    }
+
+    const avAsset = AVURLAsset.URLAssetWithURLOptions(url, null);
+    const playerItem = AVPlayerItem.playerItemWithAsset(avAsset);
+
+    // replace the current AVPlayerItem if the player already exists
+    if (this._player && this._player.currentItem) {
+      this._player.replaceCurrentItemWithPlayerItem(playerItem);
+    } else {
+      this._player = AVPlayer.playerWithPlayerItem(playerItem);
+      // @link - https://stackoverflow.com/a/42628097/1893557
+      this._player.automaticallyWaitsToMinimizeStalling = false;
+    }
+
+    // setup the status observer for the AVPlayerItem
+    this._addStatusObserver(playerItem);
+  }
+
+  private _setIOSAudioSessionOutput() {
+    const audioSession = AVAudioSession.sharedInstance();
+    const output = audioSession.currentRoute.outputs.lastObject.portType;
+    TNS_Player_Log('output', output);
+
+    if (output.match(/Receiver/)) {
+      try {
+        audioSession.setCategoryError(AVAudioSessionCategoryPlayAndRecord);
+        audioSession.overrideOutputAudioPortError(AVAudioSessionPortOverride.Speaker);
+        audioSession.setActiveError(true);
+        TNS_Player_Log('audioSession category set and active');
+      } catch (err) {
+        TNS_Player_Log('setting audioSession category failed');
+      }
     }
   }
 
-  private _reset() {
-    if (this._player) {
-      this._player = undefined;
+  private _addStatusObserver(currentItem: AVPlayerItem) {
+    this._statusObserverActive = true;
+    currentItem.addObserverForKeyPathOptionsContext(this._statusObserver, 'status', 0, null);
+  }
+
+  private _removeStatusObserver(currentItem: AVPlayerItem) {
+    // If the observer is active, then we need to remove it...
+    if (!this._statusObserverActive) {
+      return;
     }
-    if (this._task) {
-      this._task.cancel();
-      this._task = undefined;
+
+    this._statusObserverActive = false;
+    if (currentItem) {
+      currentItem.removeObserverForKeyPath(this._statusObserver, 'status');
+    }
+  }
+}
+
+class PlayerObserverClass extends NSObject {
+  observeValueForKeyPathOfObjectChangeContext(path: string, obj: Object, change: NSDictionary<any, any>, context: any) {
+    if (path === 'status') {
+      if (this['_owner']._player.currentItem.status === AVPlayerItemStatus.ReadyToPlay) {
+        // send the ready event
+        this['_owner']._sendEvent(AudioPlayerEvents.ready);
+        // if playing url, we need to call play here
+        this['_owner']._player.play();
+      }
     }
   }
 }
